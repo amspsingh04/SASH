@@ -2,6 +2,8 @@
 
 This fork modifies the original BUDDy codebase to train and perform blind dereverberation on a custom dataset of clean and reverberant audio pairs.
 
+RESULTS: [DRIVE LINK](https://drive.google.com/drive/folders/1UcCFWdqq8ra_6JKhabMavG_N_UU9Sn0d?usp=sharing)
+
 ## Summary of Changes
 
 The key modifications made to adapt the code to a custom dataset are:
