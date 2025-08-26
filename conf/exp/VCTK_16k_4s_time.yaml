@@ -1,0 +1,37 @@
+exp_name: "VCTK_16k_4s_time" #name of the experiment
+
+model_dir: experiments #directory where the model will be saved locally
+
+trainer:
+  _target_: "training.trainer.Trainer"
+
+optimizer:
+  _target_: "torch.optim.Adam"
+  lr: 1e-4
+  betas: [0.9, 0.999]
+  eps: 1e-8 #for numerical stability, we may need to modify it if usinf fp16
+  
+#for lr scheduler
+lr_rampup_it: 10000
+scheduler_step_size: 60000
+scheduler_gamma: 0.8
+
+batch_size: 16
+num_workers: 4
+seed: 1
+
+resume: True
+resume_checkpoint: None
+
+sample_rate: 16000
+audio_len: 65536
+
+ema_rate: 0.9999  #unused
+ema_rampup: 10000  #linear rampup to ema_rate   #help='EMA half-life' 
+
+
+use_grad_clip: True
+max_grad_norm: 1
+
+restore : False
+checkpoint_id: None

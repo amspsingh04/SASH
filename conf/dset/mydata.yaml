@@ -1,0 +1,20 @@
+train:
+  # This tells the program to use a general-purpose audio dataset class for training.
+  _target_: datasets.audio.AudioTrainDataset
+  # These are default settings. Your train.sh script will override the paths.
+  fs: 16000
+  segment_length: 65536
+  path: /root/hack/data/audio_16k/train/cleans
+  path_reverb: /root/hack/data/audio_16k/train/reverbs
+  normalize: False
+
+test:
+  # Use the same general-purpose class for testing.
+  _target_: datasets.audio.AudioTestDataset
+  # These are default settings. Your train.sh script will override the paths
+  fs: 16000
+  segment_length: 65536
+  path: /root/hack/data/audio_16k/valid/cleans
+  path_reverb: /root/hack/data/audio_16k/valid/reverbs
+  normalize: False
+  num_examples: 16

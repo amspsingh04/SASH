@@ -1,0 +1,19 @@
+train:
+  _target_: datasets.audio.AudioDataset  
+  fs: 16000
+  segment_length: 65536
+  path: /root/hack/data/audio/train/cleans
+  path_reverb: /root/hack/data/audio/train/reverbs
+  normalize: False
+
+  
+test:
+  _target_: datasets.audio.AudioDataset
+  fs: 16000
+  segment_length: 65536
+  path: /root/hack/data/audio/valid/cleans
+  path_reverb: /root/hack/data/audio/valid/reverbs
+  normalize: False
+  num_examples: 16
+  
+
