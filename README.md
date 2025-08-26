@@ -4,6 +4,8 @@ This fork modifies the original BUDDy codebase to train and perform blind dereve
 
 RESULTS: [DRIVE LINK](https://drive.google.com/drive/folders/1UcCFWdqq8ra_6JKhabMavG_N_UU9Sn0d?usp=sharing)
 
+[Improvements made over SGMSE](https://github.com/amspsingh04/sash/blob/main/spectrograph_sdr_pesq)
+
 ## Summary of Changes
 
 The key modifications made to adapt the code to a custom dataset are:
