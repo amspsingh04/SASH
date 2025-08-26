@@ -1,0 +1,266 @@
+# ------------------------------
+# 1. Imports
+# ------------------------------
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import librosa
+import librosa.display
+import numpy as np
+from glob import glob
+from tqdm import tqdm
+import soundfile as sf
+import matplotlib.pyplot as plt
+
+# ------------------------------
+# 2. Dataset Class
+# ------------------------------
+class SpeechDataset(Dataset):
+    def __init__(self, clean_files, reverb_files, sr=16000, fixed_length=160000):
+        self.clean_files = clean_files
+        self.reverb_files = reverb_files
+        self.sr = sr
+        self.fixed_length = fixed_length
+
+    def __len__(self):
+        return len(self.clean_files)
+
+    def __getitem__(self, idx):
+        clean, _ = librosa.load(self.clean_files[idx], sr=self.sr, mono=True)
+        reverb, _ = librosa.load(self.reverb_files[idx], sr=self.sr, mono=True)
+
+        # Normalize
+        clean = clean / (np.max(np.abs(clean)) + 1e-9)
+        reverb = reverb / (np.max(np.abs(reverb)) + 1e-9)
+
+        # Pad or truncate
+        if len(clean) < self.fixed_length:
+            pad_len = self.fixed_length - len(clean)
+            clean = np.pad(clean, (0, pad_len))
+            reverb = np.pad(reverb, (0, pad_len))
+        else:
+            clean = clean[:self.fixed_length]
+            reverb = reverb[:self.fixed_length]
+
+        return torch.tensor(reverb, dtype=torch.float32), torch.tensor(clean, dtype=torch.float32)
+
+# ------------------------------
+# 3. Conditional 1D Model
+# ------------------------------
+class Conditional1DModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(2, 16, 3, padding=1),  # 2 channels: xt + noisy
+            nn.ReLU(),
+            nn.Conv1d(16, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(16, 1, 3, padding=1)
+        )
+
+    def forward(self, x, t):
+        # x: [B, 2, L]
+        t_emb = t.float() / 1000
+        t_emb = t_emb[:, None, None].expand(-1, 1, x.shape[2])
+        return self.net(x + t_emb)
+
+# ------------------------------
+# 4. Conditional Diffusion
+# ------------------------------
+class ConditionalDiffusion(nn.Module):
+    def __init__(self, model, timesteps=1000, beta_start=1e-4, beta_end=0.02):
+        super().__init__()
+        self.model = model
+        self.timesteps = timesteps
+        self.beta = torch.linspace(beta_start, beta_end, timesteps)
+        self.alpha = 1.0 - self.beta
+        self.alpha_bar = torch.cumprod(self.alpha, dim=0)
+
+    def forward_diffusion(self, x0, t):
+        alpha_bar = self.alpha_bar.to(t.device)
+        sqrt_alpha_bar = torch.sqrt(alpha_bar[t])[:, None, None]
+        sqrt_one_minus_alpha_bar = torch.sqrt(1 - alpha_bar[t])[:, None, None]
+        epsilon = torch.randn_like(x0)
+        xt = sqrt_alpha_bar * x0 + sqrt_one_minus_alpha_bar * epsilon
+        return xt, epsilon
+
+    def reverse_diffusion(self, xt, t, cond):
+        epsilon_theta = self.model(torch.cat([xt, cond], dim=1), t)
+        
+        device = xt.device
+        alpha = self.alpha.to(device)
+        alpha_bar = self.alpha_bar.to(device)
+        beta = self.beta.to(device)
+    
+        alpha_t = alpha[t][:, None, None]
+        alpha_bar_t = alpha_bar[t][:, None, None]
+        beta_t = beta[t][:, None, None]
+    
+        x_prev = (1 / torch.sqrt(alpha_t)) * (xt - (beta_t / torch.sqrt(1 - alpha_bar_t)) * epsilon_theta)
+        return x_prev
+
+
+    def sample(self, cond):
+        xt = torch.randn_like(cond)  # start from noise or cond.clone() to start from noisy
+        for t in reversed(range(self.timesteps)):
+            batch_t = torch.tensor([t]*xt.size(0), device=xt.device)
+            xt = self.reverse_diffusion(xt, batch_t, cond)
+        return xt
+
+# ------------------------------
+# 5. Training & Evaluation
+# ------------------------------
+def evaluate_diffusion(valid_loader, model, diffusion, device):
+    mse = nn.MSELoss()
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for reverb, clean in valid_loader:
+            reverb = reverb.to(device).unsqueeze(1)
+            clean = clean.to(device).unsqueeze(1)
+            t = torch.randint(0, diffusion.timesteps, (reverb.size(0),), device=device)
+            xt, epsilon = diffusion.forward_diffusion(clean, t)
+            epsilon_theta = model(torch.cat([xt, reverb], dim=1), t)
+            loss = mse(epsilon_theta, epsilon)
+            total_loss += loss.item() * reverb.size(0)
+    return total_loss / len(valid_loader.dataset)
+
+def train_diffusion(train_loader, valid_loader, model, diffusion, optimizer, device, epochs=5):
+    mse = nn.MSELoss()
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}")
+        for batch_idx, (reverb, clean) in pbar:
+            reverb = reverb.to(device).unsqueeze(1)
+            clean = clean.to(device).unsqueeze(1)
+            t = torch.randint(0, diffusion.timesteps, (reverb.size(0),), device=device)
+            xt, epsilon = diffusion.forward_diffusion(clean, t)
+            epsilon_theta = model(torch.cat([xt, reverb], dim=1), t)
+            loss = mse(epsilon_theta, epsilon)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * reverb.size(0)
+            pbar.set_postfix(train_loss=f"{loss.item():.6f}")
+        avg_train_loss = running_loss / len(train_loader.dataset)
+        val_loss = evaluate_diffusion(valid_loader, model, diffusion, device)
+        print(f"\nEpoch {epoch+1} -> train_loss: {avg_train_loss:.6f}, val_loss: {val_loss:.6f}")
+
+# ------------------------------
+# 6. Load dataset
+# ------------------------------
+train_clean_files = sorted(glob("dataset/train/clean/*.wav"))
+train_reverb_files = sorted(glob("dataset/train/noisy/*.wav"))
+valid_clean_files = sorted(glob("dataset/valid/clean/*.wav"))
+valid_reverb_files = sorted(glob("dataset/valid/noisy/*.wav"))
+
+min_len_train = min(len(train_clean_files), len(train_reverb_files))
+min_len_valid = min(len(valid_clean_files), len(valid_reverb_files))
+
+train_clean_files = train_clean_files[:min_len_train]
+train_reverb_files = train_reverb_files[:min_len_train]
+valid_clean_files = valid_clean_files[:min_len_valid]
+valid_reverb_files = valid_reverb_files[:min_len_valid]
+
+train_dataset = SpeechDataset(train_clean_files, train_reverb_files)
+valid_dataset = SpeechDataset(valid_clean_files, valid_reverb_files)
+
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+valid_loader = DataLoader(valid_dataset, batch_size=4)
+
+# ------------------------------
+# 7. Instantiate model
+# ------------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = Conditional1DModel().to(device)
+diffusion = ConditionalDiffusion(model).to(device)
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+# ------------------------------
+# 8. Train model
+# ------------------------------
+train_diffusion(train_loader, valid_loader, model, diffusion, optimizer, device, epochs=5)
+
+# ------------------------------
+# 9. Sample & Compare
+# ------------------------------
+def plot_spectrogram_comparison(clean_file, noisy_file, enhanced_signal, sr=16000, save_path=None):
+    x, _ = librosa.load(clean_file, sr=sr)
+    y, _ = librosa.load(noisy_file, sr=sr)
+    x_hat = enhanced_signal
+
+    def get_spectrogram(signal):
+        S = librosa.stft(signal, n_fft=512, hop_length=256)
+        return librosa.amplitude_to_db(np.abs(S), ref=np.max)
+
+    S_clean = get_spectrogram(x)
+    S_noisy = get_spectrogram(y)
+    S_enhanced = get_spectrogram(x_hat)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for ax, S, title in zip(axes, [S_noisy, S_clean, S_enhanced], ["Noisy", "Clean", "Enhanced"]):
+        img = librosa.display.specshow(S, sr=sr, hop_length=256, x_axis='time', y_axis='hz', ax=ax)
+        ax.set_title(title)
+        fig.colorbar(img, ax=ax, format="%+2.0f dB")
+    plt.tight_layout()
+    if save_path: plt.savefig(save_path)
+    plt.show()
+
+# Take first validation sample
+reverb, clean = valid_dataset[0]
+reverb = reverb.unsqueeze(0).unsqueeze(0).to(device)
+# Generate enhanced signal
+enhanced_signal = diffusion.sample(reverb).detach().cpu().numpy()[0,0]
+
+# Plot
+plot_spectrogram_comparison(valid_clean_files[0], valid_reverb_files[0], enhanced_signal)
+
+# Save audio
+sf.write("generated_sample.wav", sample.detach().cpu().numpy()[0,0], samplerate=16000)
+import numpy as np
+from pesq import pesq
+import mir_eval
+
+# ------------------------------
+# 2. Load signals
+# ------------------------------
+sr = 16000
+
+# Already have enhanced_signal from diffusion
+enhanced = enhanced_signal
+clean, _ = librosa.load(valid_clean_files[0], sr=sr)
+noisy, _ = librosa.load(valid_reverb_files[0], sr=sr)
+
+# Ensure same length
+min_len = min(len(clean), len(noisy), len(enhanced))
+clean = clean[:min_len]
+noisy = noisy[:min_len]
+enhanced = enhanced[:min_len]
+
+# ------------------------------
+# 3. Compute SDR
+# ------------------------------
+# mir_eval expects shape (nsrc, nsamples)
+sdr_noisy, _, _, _ = mir_eval.separation.bss_eval_sources(
+    np.expand_dims(clean, axis=0),
+    np.expand_dims(noisy, axis=0)
+)
+sdr_enhanced, _, _, _ = mir_eval.separation.bss_eval_sources(
+    np.expand_dims(clean, axis=0),
+    np.expand_dims(enhanced, axis=0)
+)
+
+print(f"SDR Noisy: {sdr_noisy[0]:.2f} dB")
+print(f"SDR Enhanced: {sdr_enhanced[0]:.2f} dB")
+
+# ------------------------------
+# 4. Compute PESQ
+# ------------------------------
+pesq_noisy = pesq(sr, clean, noisy, 'wb')
+pesq_enhanced = pesq(sr, clean, enhanced, 'wb')
+
+print(f"PESQ Noisy: {pesq_noisy:.2f}")
+print(f"PESQ Enhanced: {pesq_enhanced:.2f}")
